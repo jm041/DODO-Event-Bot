@@ -14,7 +14,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger('dodo_helper')
 TOKEN = os.environ['DISCORD_TOKEN']
 DATABASE_URL = os.environ['DATABASE_URL']
-GUILD_ID = int(os.getenv('GUILD_ID') or 0)
+OWNER_GUILD_ID = 1558462262132351096
 MENTION_ONLY = re.compile(r'<@!?(\d+)>')
 
 intents = discord.Intents.default()
@@ -176,6 +176,8 @@ async def before_expiry():
     await bot.wait_until_ready()
 
 async def create_event(interaction,kind,title,capacity,minutes):
+    if interaction.guild_id != OWNER_GUILD_ID:
+        await interaction.response.send_message('이 명령어는 운영 서버에서만 사용할 수 있습니다.', ephemeral=True);return
     if not interaction.guild or not isinstance(interaction.channel,discord.abc.Messageable):
         await interaction.response.send_message('서버의 텍스트 채널에서 실행해 주세요.',ephemeral=True);return
     if not 1<=capacity<=1000 or not 1<=minutes<=43200 or not title.strip():
@@ -209,6 +211,8 @@ async def first(interaction:discord.Interaction,내용:str,모집인원:app_comm
 
 @bot.tree.command(name='이벤트취소',description='본인이 개최한 이벤트를 취소합니다.')
 async def cancel(interaction:discord.Interaction,이벤트번호:int):
+    if interaction.guild_id != OWNER_GUILD_ID:
+        await interaction.response.send_message('이 명령어는 운영 서버에서만 사용할 수 있습니다.', ephemeral=True);return
     await interaction.response.defer(ephemeral=True)
     async with pool.acquire() as c:
         async with c.transaction():
@@ -224,6 +228,8 @@ async def cancel(interaction:discord.Interaction,이벤트번호:int):
 
 @bot.tree.command(name='나눔재추첨',description='종료된 본인 나눔에서 당첨자를 다시 추첨합니다.')
 async def redraw(interaction:discord.Interaction,이벤트번호:int):
+    if interaction.guild_id != OWNER_GUILD_ID:
+        await interaction.response.send_message('이 명령어는 운영 서버에서만 사용할 수 있습니다.', ephemeral=True);return
     await interaction.response.defer(ephemeral=True)
     async with pool.acquire() as c:
         async with c.transaction():
@@ -268,12 +274,12 @@ async def main():
         bot.add_view(EventView(e['id']),message_id=e['message_id'])
     async with bot:
         await bot.login(TOKEN)
-        if GUILD_ID:
-            guild=discord.Object(id=GUILD_ID)
-            bot.tree.copy_global_to(guild=guild)
-            await bot.tree.sync(guild=guild)
-        else:
-            await bot.tree.sync()
+        # Register slash commands only in the owner's guild.
+        guild = discord.Object(id=OWNER_GUILD_ID)
+        bot.tree.copy_global_to(guild=guild)
+        bot.tree.clear_commands(guild=None)
+        await bot.tree.sync()  # Remove any previously published global commands.
+        await bot.tree.sync(guild=guild)
         expiry_loop.start()
         await bot.connect()
 
