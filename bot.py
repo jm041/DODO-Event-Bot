@@ -267,6 +267,7 @@ async def main():
     for e in active:
         bot.add_view(EventView(e['id']),message_id=e['message_id'])
     async with bot:
+        await bot.login(TOKEN)
         if GUILD_ID:
             guild=discord.Object(id=GUILD_ID)
             bot.tree.copy_global_to(guild=guild)
@@ -274,7 +275,7 @@ async def main():
         else:
             await bot.tree.sync()
         expiry_loop.start()
-        await bot.start(TOKEN)
+        await bot.connect()
 
 if __name__=='__main__':
     asyncio.run(main())
