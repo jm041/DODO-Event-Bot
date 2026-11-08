@@ -252,7 +252,7 @@ async def on_message(message:discord.Message):
     match=MENTION_ONLY.fullmatch(message.content.strip())
     if not match or len(message.mentions)!=1 or message.mention_everyone or message.role_mentions:return
     if int(match.group(1))!=message.mentions[0].id:return
-    await message.channel.send(f'```text\n{match.group(1)}\n```',allowed_mentions=discord.AllowedMentions.none(),reference=message.to_reference(fail_if_not_exists=False),mention_author=False)
+    await message.channel.send(match.group(1), allowed_mentions=discord.AllowedMentions.none())
 
 @bot.event
 async def on_ready():
