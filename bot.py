@@ -254,36 +254,58 @@ async def redraw(interaction:discord.Interaction,이벤트번호:int):
             await ch.send('🔄 **나눔 재추첨 결과**\n'+'\n'.join(f'<@{u}>' for u in winners),allowed_mentions=discord.AllowedMentions(users=True,roles=False,everyone=False))
         except (discord.Forbidden,discord.HTTPException): pass
 
-# Extract recipient ONLY when a successful transfer embed explicitly contains a user mention.
-# Never guess from display names: multiple members may share the same name.
-TRANSFER_RECIPIENT = re.compile(r"<@!?(\d{17,20})>\s*님에게")
+# A transfer can arrive as a new message or an edited interaction response.
+# Only trust actual Discord mention IDs, never nicknames or avatar images.
+TRANSFER_RECIPIENT = re.compile(r"<@!?(\d{17,20})>")
+_notified_transfers: set[int] = set()
 
 async def notify_transfer_recipient(message: discord.Message):
-    if not DODO_BOT_ID or message.author.id != DODO_BOT_ID:
+    if not DODO_BOT_ID or message.author.id != DODO_BOT_ID or not message.guild:
         return
-    # Only react to the Dodo bot's successful transfer result, not slash invocation,
-    # failures, unrelated embeds, or other bots.
+    if message.id in _notified_transfers:
+        return
     for embed in message.embeds:
-        parts = [embed.title or "", embed.description or ""]
+        parts = [embed.title or "", embed.description or "", embed.footer.text or ""]
         for field in embed.fields:
             parts.extend((field.name or "", field.value or ""))
         body = "\n".join(parts)
         if "송금 성공" not in body:
             continue
-        match = TRANSFER_RECIPIENT.search(body)
+        # Usually the first mention is the recipient in '...님에게 ...원을 송금'.
+        recipient_line = next((line for line in body.splitlines()
+                               if "송금했" in line or "님에게" in line), "")
+        match = TRANSFER_RECIPIENT.search(recipient_line)
         if not match:
-            log.info("Transfer success found but recipient ID not present in embed; skipping")
-            continue
+            log.warning("Transfer success detected but no recipient mention found. message=%s embed=%r", message.id, body[:700])
+            return
         recipient_id = int(match.group(1))
+        _notified_transfers.add(message.id)
         try:
-            await message.channel.send(
+            await message.reply(
                 f"💰 송금 도착! <@{recipient_id}>",
-                reference=message.to_reference(fail_if_not_exists=False),
+                mention_author=False,
                 allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=recipient_id)], roles=False, everyone=False),
             )
         except (discord.Forbidden, discord.HTTPException):
+            _notified_transfers.discard(message.id)
             log.exception("Could not send transfer recipient notification")
         return
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    await notify_transfer_recipient(after)
+
+@bot.event
+async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
+    # Cached edits are already handled above; fetch uncached edited messages.
+    if payload.cached_message is not None:
+        return
+    try:
+        channel = bot.get_channel(payload.channel_id) or await bot.fetch_channel(payload.channel_id)
+        message = await channel.fetch_message(payload.message_id)
+        await notify_transfer_recipient(message)
+    except (discord.Forbidden, discord.HTTPException, AttributeError):
+        log.exception("Could not inspect edited Dodo message")
 
 @bot.event
 async def on_message(message:discord.Message):
