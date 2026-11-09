@@ -15,6 +15,8 @@ log = logging.getLogger('dodo_helper')
 TOKEN = os.environ['DISCORD_TOKEN']
 DATABASE_URL = os.environ['DATABASE_URL']
 OWNER_GUILD_ID = 1558462262132351096
+# Set to the actual Dodo bot user ID in Railway Variables. 0 disables transfer alerts.
+DODO_BOT_ID = int(os.getenv("DODO_BOT_ID", "0"))
 MENTION_ONLY = re.compile(r'<@!?(\d+)>')
 
 intents = discord.Intents.default()
@@ -252,9 +254,44 @@ async def redraw(interaction:discord.Interaction,이벤트번호:int):
             await ch.send('🔄 **나눔 재추첨 결과**\n'+'\n'.join(f'<@{u}>' for u in winners),allowed_mentions=discord.AllowedMentions(users=True,roles=False,everyone=False))
         except (discord.Forbidden,discord.HTTPException): pass
 
+# Extract recipient ONLY when a successful transfer embed explicitly contains a user mention.
+# Never guess from display names: multiple members may share the same name.
+TRANSFER_RECIPIENT = re.compile(r"<@!?(\d{17,20})>\s*님에게")
+
+async def notify_transfer_recipient(message: discord.Message):
+    if not DODO_BOT_ID or message.author.id != DODO_BOT_ID:
+        return
+    # Only react to the Dodo bot's successful transfer result, not slash invocation,
+    # failures, unrelated embeds, or other bots.
+    for embed in message.embeds:
+        parts = [embed.title or "", embed.description or ""]
+        for field in embed.fields:
+            parts.extend((field.name or "", field.value or ""))
+        body = "\n".join(parts)
+        if "송금 성공" not in body:
+            continue
+        match = TRANSFER_RECIPIENT.search(body)
+        if not match:
+            log.info("Transfer success found but recipient ID not present in embed; skipping")
+            continue
+        recipient_id = int(match.group(1))
+        try:
+            await message.channel.send(
+                f"💰 송금 도착! <@{recipient_id}>",
+                reference=message.to_reference(fail_if_not_exists=False),
+                allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=recipient_id)], roles=False, everyone=False),
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            log.exception("Could not send transfer recipient notification")
+        return
+
 @bot.event
 async def on_message(message:discord.Message):
-    if message.author.bot or message.guild is None:return
+    if message.guild is None:
+        return
+    if message.author.bot:
+        await notify_transfer_recipient(message)
+        return
     match=MENTION_ONLY.fullmatch(message.content.strip())
     if not match or len(message.mentions)!=1 or message.mention_everyone or message.role_mentions:return
     if int(match.group(1))!=message.mentions[0].id:return
