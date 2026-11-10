@@ -16,6 +16,7 @@ TOKEN = os.environ['DISCORD_TOKEN']
 DATABASE_URL = os.environ['DATABASE_URL']
 OWNER_GUILD_ID = 1558462262132351096
 OWNER_ID_CHANNEL_IDS = {1566775552076156948, 1566774361736872138}
+TRANSFER_LOG_CHANNEL_ID = 1566774361736872138
 # Set to the actual Dodo bot user ID in Railway Variables. 0 disables transfer alerts.
 DODO_BOT_ID = int(os.getenv("DODO_BOT_ID", "0"))
 MENTION_ONLY = re.compile(r'<@!?(\d+)>')
@@ -262,7 +263,10 @@ TRANSFER_AMOUNT = re.compile(r"님에게\s*([\d,]+)\s*원을?\s*송금")
 _notified_transfers: set[int] = set()
 
 async def notify_transfer_recipient(message: discord.Message):
-    if not DODO_BOT_ID or message.author.id != DODO_BOT_ID or not message.guild:
+    # 송금 감지/전달/수신자 멘션은 운영 서버에서만 허용.
+    if message.guild is None or message.guild.id != OWNER_GUILD_ID:
+        return
+    if not DODO_BOT_ID or message.author.id != DODO_BOT_ID:
         return
     if message.id in _notified_transfers:
         return
@@ -288,14 +292,31 @@ async def notify_transfer_recipient(message: discord.Message):
         amount = int(amount_match.group(1).replace(",", ""))
         _notified_transfers.add(message.id)
         try:
-            await message.reply(
+            # In the owner's server, send a copy to the designated log channel.
+            # Do not post a second notification in the original channel.
+            target = message
+            if message.guild.id == OWNER_GUILD_ID and message.channel.id != TRANSFER_LOG_CHANNEL_ID:
+                log_channel = message.guild.get_channel(TRANSFER_LOG_CHANNEL_ID)
+                if log_channel is None:
+                    log_channel = await bot.fetch_channel(TRANSFER_LOG_CHANNEL_ID)
+                # A bot cannot impersonate the original Dodo bot. Copy its embeds,
+                # include a jump link, then reply to the copied message.
+                copied_embeds = [discord.Embed.from_dict(e.to_dict()) for e in message.embeds[:10]]
+                safe_content = discord.utils.escape_mentions(message.content or "")
+                header = f"📨 **송금 내역 전달** · [원본 메시지]({message.jump_url})"
+                target = await log_channel.send(
+                    content=header + ("\n" + safe_content[:1500] if safe_content else ""),
+                    embeds=copied_embeds,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            await target.reply(
                 f"💰 <@{recipient_id}>님에게 **{amount:,}원**이 송금되었습니다!",
                 mention_author=False,
                 allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=recipient_id)], roles=False, everyone=False),
             )
         except (discord.Forbidden, discord.HTTPException):
             _notified_transfers.discard(message.id)
-            log.exception("Could not send transfer recipient notification")
+            log.exception("Could not forward transfer or send recipient notification")
         return
 
 @bot.event
