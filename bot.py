@@ -316,9 +316,9 @@ async def notify_transfer_recipient(message: discord.Message):
                         embeds=copied_embeds,
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
-                await target.reply(
+                # Send a regular channel message (not a reply) below the transfer record.
+                await target.channel.send(
                     f"💰 <@{recipient_id}>님에게 **{amount:,}원**이 송금되었습니다!",
-                    mention_author=False,
                     allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=recipient_id)], roles=False, everyone=False),
                 )
                 _notified_transfers.add(message.id)
