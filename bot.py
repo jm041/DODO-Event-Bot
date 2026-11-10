@@ -259,65 +259,72 @@ async def redraw(interaction:discord.Interaction,이벤트번호:int):
 # A transfer can arrive as a new message or an edited interaction response.
 # Only trust actual Discord mention IDs, never nicknames or avatar images.
 TRANSFER_RECIPIENT = re.compile(r"<@!?(\d{17,20})>")
-TRANSFER_AMOUNT = re.compile(r"님에게\s*([\d,]+)\s*원을?\s*송금")
+TRANSFER_AMOUNT = re.compile(r"([\d,]+)\s*원을?\s*송금")
 _notified_transfers: set[int] = set()
+_transfer_locks: dict[int, asyncio.Lock] = {}
 
 async def notify_transfer_recipient(message: discord.Message):
-    # 송금 감지/전달/수신자 멘션은 운영 서버에서만 허용.
     if message.guild is None or message.guild.id != OWNER_GUILD_ID:
         return
     if not DODO_BOT_ID or message.author.id != DODO_BOT_ID:
         return
-    if message.id in _notified_transfers:
-        return
-    for embed in message.embeds:
-        parts = [embed.title or "", embed.description or "", embed.footer.text or ""]
-        for field in embed.fields:
-            parts.extend((field.name or "", field.value or ""))
-        body = "\n".join(parts)
-        if "송금 성공" not in body:
-            continue
-        # Usually the first mention is the recipient in '...님에게 ...원을 송금'.
-        recipient_line = next((line for line in body.splitlines()
-                               if "송금했" in line or "님에게" in line), "")
-        match = TRANSFER_RECIPIENT.search(recipient_line)
-        if not match:
-            log.warning("Transfer success detected but no recipient mention found. message=%s embed=%r", message.id, body[:700])
+    lock = _transfer_locks.setdefault(message.id, asyncio.Lock())
+    async with lock:
+        if message.id in _notified_transfers:
             return
-        recipient_id = int(match.group(1))
-        amount_match = TRANSFER_AMOUNT.search(recipient_line)
-        if not amount_match:
-            log.warning("Transfer recipient found but amount missing. message=%s line=%r", message.id, recipient_line)
-            return
-        amount = int(amount_match.group(1).replace(",", ""))
-        _notified_transfers.add(message.id)
-        try:
-            # In the owner's server, send a copy to the designated log channel.
-            # Do not post a second notification in the original channel.
-            target = message
-            if message.guild.id == OWNER_GUILD_ID and message.channel.id != TRANSFER_LOG_CHANNEL_ID:
-                log_channel = message.guild.get_channel(TRANSFER_LOG_CHANNEL_ID)
-                if log_channel is None:
-                    log_channel = await bot.fetch_channel(TRANSFER_LOG_CHANNEL_ID)
-                # A bot cannot impersonate the original Dodo bot. Copy its embeds,
-                # include a jump link, then reply to the copied message.
-                copied_embeds = [discord.Embed.from_dict(e.to_dict()) for e in message.embeds[:10]]
-                safe_content = discord.utils.escape_mentions(message.content or "")
-                header = f"📨 **송금 내역 전달** · [원본 메시지]({message.jump_url})"
-                target = await log_channel.send(
-                    content=header + ("\n" + safe_content[:1500] if safe_content else ""),
-                    embeds=copied_embeds,
-                    allowed_mentions=discord.AllowedMentions.none(),
+        for embed in message.embeds:
+            parts = [embed.title or "", embed.description or "", embed.footer.text or ""]
+            for field in embed.fields:
+                parts.extend((field.name or "", field.value or ""))
+            body = "\n".join(parts)
+            if "송금 성공" not in body:
+                continue
+            # Read the success sentence rather than a balance line or fee line.
+            lines = body.splitlines()
+            recipient_line = next((line for line in lines if "님에게" in line and "송금" in line), "")
+            if not recipient_line:
+                recipient_line = next((line for line in lines if "님에게" in line), "")
+            recipient_match = TRANSFER_RECIPIENT.search(recipient_line)
+            # Some bot embeds put the receiver mention in a separate field.
+            if not recipient_match:
+                recipient_match = TRANSFER_RECIPIENT.search(body)
+            if not recipient_match:
+                log.warning("Dodo transfer detected, recipient ID not found: msg=%s channel=%s embed=%r mentions=%s",
+                            message.id, message.channel.id, body[:900], [u.id for u in message.mentions])
+                return
+            recipient_id = int(recipient_match.group(1))
+            amount_match = TRANSFER_AMOUNT.search(recipient_line)
+            if not amount_match:
+                amount_match = TRANSFER_AMOUNT.search(body)
+            if not amount_match:
+                log.warning("Dodo transfer detected, amount not found: msg=%s embed=%r", message.id, body[:900])
+                return
+            amount = int(amount_match.group(1).replace(",", ""))
+            log.info("Dodo transfer detected: msg=%s from_channel=%s recipient=%s amount=%s",
+                     message.id, message.channel.id, recipient_id, amount)
+            try:
+                target = message
+                if message.channel.id != TRANSFER_LOG_CHANNEL_ID:
+                    log_channel = message.guild.get_channel(TRANSFER_LOG_CHANNEL_ID)
+                    if log_channel is None:
+                        log_channel = await bot.fetch_channel(TRANSFER_LOG_CHANNEL_ID)
+                    copied_embeds = [discord.Embed.from_dict(e.to_dict()) for e in message.embeds[:10]]
+                    safe_content = discord.utils.escape_mentions(message.content or "")
+                    header = f"📨 **송금 내역 전달** · [원본 메시지]({message.jump_url})"
+                    target = await log_channel.send(
+                        content=header + ("\n" + safe_content[:1500] if safe_content else ""),
+                        embeds=copied_embeds,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                await target.reply(
+                    f"💰 <@{recipient_id}>님에게 **{amount:,}원**이 송금되었습니다!",
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=recipient_id)], roles=False, everyone=False),
                 )
-            await target.reply(
-                f"💰 <@{recipient_id}>님에게 **{amount:,}원**이 송금되었습니다!",
-                mention_author=False,
-                allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=recipient_id)], roles=False, everyone=False),
-            )
-        except (discord.Forbidden, discord.HTTPException):
-            _notified_transfers.discard(message.id)
-            log.exception("Could not forward transfer or send recipient notification")
-        return
+                _notified_transfers.add(message.id)
+            except (discord.Forbidden, discord.HTTPException):
+                log.exception("Could not forward transfer or send recipient notification: msg=%s", message.id)
+            return
 
 @bot.event
 async def on_message_edit(before: discord.Message, after: discord.Message):
@@ -339,8 +346,10 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
 async def on_message(message:discord.Message):
     if message.guild is None:
         return
-    if message.author.bot:
+    if message.author.id == DODO_BOT_ID:
         await notify_transfer_recipient(message)
+        return
+    if message.author.bot:
         return
     # Restrict ID lookup to two channels in the owner server only.
     # Other servers may use ID lookup in any accessible channel.
