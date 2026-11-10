@@ -15,6 +15,7 @@ log = logging.getLogger('dodo_helper')
 TOKEN = os.environ['DISCORD_TOKEN']
 DATABASE_URL = os.environ['DATABASE_URL']
 OWNER_GUILD_ID = 1558462262132351096
+OWNER_ID_CHANNEL_IDS = {1566775552076156948, 1566774361736872138}
 # Set to the actual Dodo bot user ID in Railway Variables. 0 disables transfer alerts.
 DODO_BOT_ID = int(os.getenv("DODO_BOT_ID", "0"))
 MENTION_ONLY = re.compile(r'<@!?(\d+)>')
@@ -257,6 +258,7 @@ async def redraw(interaction:discord.Interaction,이벤트번호:int):
 # A transfer can arrive as a new message or an edited interaction response.
 # Only trust actual Discord mention IDs, never nicknames or avatar images.
 TRANSFER_RECIPIENT = re.compile(r"<@!?(\d{17,20})>")
+TRANSFER_AMOUNT = re.compile(r"님에게\s*([\d,]+)\s*원을?\s*송금")
 _notified_transfers: set[int] = set()
 
 async def notify_transfer_recipient(message: discord.Message):
@@ -279,10 +281,15 @@ async def notify_transfer_recipient(message: discord.Message):
             log.warning("Transfer success detected but no recipient mention found. message=%s embed=%r", message.id, body[:700])
             return
         recipient_id = int(match.group(1))
+        amount_match = TRANSFER_AMOUNT.search(recipient_line)
+        if not amount_match:
+            log.warning("Transfer recipient found but amount missing. message=%s line=%r", message.id, recipient_line)
+            return
+        amount = int(amount_match.group(1).replace(",", ""))
         _notified_transfers.add(message.id)
         try:
             await message.reply(
-                f"💰 송금 도착! <@{recipient_id}>",
+                f"💰 <@{recipient_id}>님에게 **{amount:,}원**이 송금되었습니다!",
                 mention_author=False,
                 allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=recipient_id)], roles=False, everyone=False),
             )
@@ -313,6 +320,10 @@ async def on_message(message:discord.Message):
         return
     if message.author.bot:
         await notify_transfer_recipient(message)
+        return
+    # Restrict ID lookup to two channels in the owner server only.
+    # Other servers may use ID lookup in any accessible channel.
+    if message.guild.id == OWNER_GUILD_ID and message.channel.id not in OWNER_ID_CHANNEL_IDS:
         return
     match=MENTION_ONLY.fullmatch(message.content.strip())
     if not match or len(message.mentions)!=1 or message.mention_everyone or message.role_mentions:return
