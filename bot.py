@@ -40,6 +40,9 @@ CREATE TABLE IF NOT EXISTS entries (
  PRIMARY KEY(event_id,user_id)
 );
 CREATE INDEX IF NOT EXISTS idx_events_open ON events(status,ends_at);
+CREATE TABLE IF NOT EXISTS first_announcements (
+ event_id BIGINT PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE
+);
 '''
 
 async def get_event(event_id, conn=None):
@@ -117,6 +120,48 @@ async def refresh(event_id):
     except (discord.NotFound,discord.Forbidden,discord.HTTPException) as exc:
         log.warning('Cannot refresh event %s: %s',event_id,exc)
 
+async def announce_first_closed(event_id):
+    """Post a final first-come list exactly once after the event closes."""
+    async with pool.acquire() as c:
+        async with c.transaction():
+            e = await c.fetchrow('SELECT * FROM events WHERE id=$1', event_id)
+            if not e or e['kind'] != 'first' or e['status'] != 'closed':
+                return
+            claimed = await c.fetchval(
+                'INSERT INTO first_announcements(event_id) VALUES($1) '
+                'ON CONFLICT DO NOTHING RETURNING event_id', event_id
+            )
+            if claimed is None:
+                return
+    try:
+        ids = await members(event_id)
+        ch = bot.get_channel(e['channel_id']) or await bot.fetch_channel(e['channel_id'])
+        count = len(ids)
+        header = (f'🎉 **선착순 모집 마감 — 최종 명단**\n'
+                  f'📌 모집 내용: **{discord.utils.escape_markdown(e["title"])}**\n'
+                  f'👥 최종 참여: **{count}명 / {e["capacity"]}명**\n\n'
+                  f'🏆 **확정 참여자**\n')
+        lines = [f'{i}. <@{uid}>' for i, uid in enumerate(ids, 1)]
+        if not lines:
+            lines = ['참여자가 없습니다.']
+        # Split long rosters into multiple messages to stay below Discord's 2000-char limit.
+        parts = []
+        current = header
+        for line in lines:
+            if len(current) + len(line) + 1 > 1800:
+                parts.append(current)
+                current = ''
+            current += line + '\n'
+        current += '\n✅ 모집이 종료되었습니다.'
+        parts.append(current)
+        for part in parts:
+            await ch.send(part, allowed_mentions=discord.AllowedMentions.none())
+    except Exception:
+        # Release claim for retry if posting fails.
+        async with pool.acquire() as c:
+            await c.execute('DELETE FROM first_announcements WHERE event_id=$1', event_id)
+        log.exception('Cannot announce first-come event %s', event_id)
+
 async def handle_entry(interaction,event_id,joining):
     if interaction.guild is None:
         await interaction.response.send_message('서버에서만 이용할 수 있습니다.',ephemeral=True);return
@@ -146,6 +191,7 @@ async def handle_entry(interaction,event_id,joining):
                 result='참여를 취소했습니다.' if deleted.endswith('1') else '참여 기록이 없습니다.'
     await interaction.followup.send(result,ephemeral=True)
     await refresh(event_id)
+    await announce_first_closed(event_id)
 
 async def finish_event(event_id):
     announcement=None
@@ -160,6 +206,7 @@ async def finish_event(event_id):
                 if winners: announcement='🎉 **나눔 당첨자 발표**\n'+ '\n'.join(f'<@{u}>' for u in winners)
                 else: announcement='🎁 나눔이 종료되었습니다. 참여자가 없어 당첨자가 없습니다.'
     await refresh(event_id)
+    await announce_first_closed(event_id)
     if announcement:
         try:
             ch=bot.get_channel(e['channel_id']) or await bot.fetch_channel(e['channel_id'])
@@ -174,6 +221,10 @@ async def expiry_loop():
     for row in ids:
         try: await finish_event(row['id'])
         except Exception: log.exception('Error finishing event %s',row['id'])
+    async with pool.acquire() as c:
+        pending=await c.fetch("SELECT e.id FROM events e LEFT JOIN first_announcements a ON a.event_id=e.id WHERE e.kind='first' AND e.status='closed' AND a.event_id IS NULL ORDER BY e.id LIMIT 100")
+    for row in pending:
+        await announce_first_closed(row['id'])
 
 @expiry_loop.before_loop
 async def before_expiry():
