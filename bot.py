@@ -137,25 +137,39 @@ async def announce_first_closed(event_id):
         ids = await members(event_id)
         ch = bot.get_channel(e['channel_id']) or await bot.fetch_channel(e['channel_id'])
         count = len(ids)
-        header = (f'🎉 **선착순 모집 마감 — 최종 명단**\n'
-                  f'📌 모집 내용: **{discord.utils.escape_markdown(e["title"])}**\n'
-                  f'👥 최종 참여: **{count}명 / {e["capacity"]}명**\n\n'
-                  f'🏆 **확정 참여자**\n')
+        safe_title = discord.utils.escape_markdown(e['title'])
+        # Discord embed limits: description 4096, field value 1024, total 6000.
+        # Divide large rosters into multiple embeds without changing participant order.
         lines = [f'{i}. <@{uid}>' for i, uid in enumerate(ids, 1)]
         if not lines:
             lines = ['참여자가 없습니다.']
-        # Split long rosters into multiple messages to stay below Discord's 2000-char limit.
-        parts = []
-        current = header
+        chunks = []
+        current = ''
         for line in lines:
-            if len(current) + len(line) + 1 > 1800:
-                parts.append(current)
+            if len(current) + len(line) + 1 > 900:
+                chunks.append(current.rstrip())
                 current = ''
             current += line + '\n'
-        current += '\n✅ 모집이 종료되었습니다.'
-        parts.append(current)
-        for part in parts:
-            await ch.send(part, allowed_mentions=discord.AllowedMentions.none())
+        if current:
+            chunks.append(current.rstrip())
+        # Limit each embed to 4 roster fields, keeping total embed size safely below 6000.
+        pages = [chunks[i:i + 4] for i in range(0, len(chunks), 4)]
+        for page_index, page_chunks in enumerate(pages, 1):
+            embed = discord.Embed(
+                title='🎉 선착순 모집 마감 — 최종 명단',
+                description=(f'📌 **모집 내용:** {safe_title[:1000]}\n'
+                             f'👥 **최종 참여:** {count}명 / {e["capacity"]}명\n'
+                             f'🏁 **마감 사유:** {"정원 마감" if count >= e["capacity"] else "시간 마감"}'),
+                color=discord.Color.green(),
+            )
+            for idx, chunk in enumerate(page_chunks, 1):
+                embed.add_field(
+                    name='🏆 확정 참여자' if page_index == 1 and idx == 1 else '🏆 확정 참여자 (계속)',
+                    value=chunk,
+                    inline=False,
+                )
+            embed.set_footer(text=f'이벤트 #{event_id} · {page_index}/{len(pages)}페이지 · 모집 종료')
+            await ch.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
     except Exception:
         # Release claim for retry if posting fails.
         async with pool.acquire() as c:
