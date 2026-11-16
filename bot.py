@@ -401,14 +401,20 @@ async def notify_transfer_recipient(message: discord.Message):
 
 # Homework completion is identified only from Dodo's own interaction response.
 # A successful dig alone is not sufficient: the completion-box award must be present.
-HOMEWORK_BOX = re.compile(r"오늘도\s*수고\s*박스\s*(?:🎁\s*)?(\d[\d,]*)\s*개(?:를|을)?\s*(?:준|지급|획득|받)")
+HOMEWORK_BOX = re.compile(
+    r"오늘도\s*수고\s*박스[\s\S]{0,80}?(\d[\d,]*)\s*개(?:를|을)?\s*(?:준|지급|획득|받)"
+)
+HOMEWORK_DONE = re.compile(r"오늘의\s*모든\s*할\s*일을\s*다\s*했구나")
 
 
 def homework_result(message: discord.Message):
-    """Return (actor_id, box_count) only when the Dodo response proves both."""
+    """Return (actor_id, box_count) only for a verified Dodo completion award."""
     if message.guild is None or message.guild.id != OWNER_GUILD_ID:
         return None
-    if not DODO_BOT_ID or message.author.id != DODO_BOT_ID:
+    if not DODO_BOT_ID:
+        log.warning("Homework disabled: Railway DODO_BOT_ID is missing")
+        return None
+    if message.author.id != DODO_BOT_ID:
         return None
     texts = [message.content or ""]
     for embed in message.embeds:
@@ -416,23 +422,30 @@ def homework_result(message: discord.Message):
         for field in embed.fields:
             texts.extend([field.name or "", field.value or ""])
     body = "\n".join(texts)
-    if "땅파기 성공" not in body:
+    if "오늘도수고박스" not in body and not re.search(r"오늘도\s*수고\s*박스", body):
+        return None
+    if "땅파기 성공" not in body or not HOMEWORK_DONE.search(body):
+        log.warning("Homework award but missing success/completion proof: message=%s body=%r", message.id, body[:800])
         return None
     match = HOMEWORK_BOX.search(body)
     if not match:
+        log.warning("Homework box count not parsed: message=%s body=%r", message.id, body[:800])
         return None
-    # Interaction metadata belongs to the actual Discord application command.
-    # Do not infer the actor from embed mentions, names, or nearby messages.
     meta = getattr(message, "interaction_metadata", None) or getattr(message, "interaction", None)
     user = getattr(meta, "user", None) if meta is not None else None
     command_name = getattr(meta, "name", None)
-    if not user:
-        log.warning("Homework award found but interaction user unavailable: message=%s", message.id)
+    if user is None:
+        log.warning("Homework award found but interaction user unavailable: message=%s metadata_type=%s", message.id, type(meta).__name__)
         return None
     if command_name and "땅파기" not in command_name:
-        log.warning("Homework award with unexpected interaction command: %s", command_name)
+        log.warning("Homework unexpected interaction command: message=%s command=%s", message.id, command_name)
         return None
-    return user.id, int(match.group(1).replace(",", ""))
+    count = int(match.group(1).replace(",", ""))
+    if count < 1 or count > 999:
+        log.warning("Homework invalid box count: message=%s count=%s", message.id, count)
+        return None
+    log.info("Homework completion matched: message=%s user=%s boxes=%s", message.id, user.id, count)
+    return user.id, count
 
 
 async def send_homework_webhook(channel, member, embed):
@@ -453,7 +466,7 @@ async def send_homework_webhook(channel, member, embed):
     display_name = member.display_name[:80] or str(member.id)
     # Prefer the member's server avatar, then their global user avatar.
     # Fetching the user also handles an incomplete member object in cache.
-    avatar_asset = member.guild_avatar or member.avatar
+    avatar_asset = member.display_avatar
     if avatar_asset is None:
         try:
             fetched_user = await bot.fetch_user(member.id)
@@ -511,6 +524,38 @@ async def homework_test(
     except Exception:
         log.exception('Homework test unexpected error')
         await interaction.followup.send('테스트 중 오류가 발생했어. Railway 로그를 확인해 줘.', ephemeral=True)
+
+
+@bot.tree.command(name='숙제인증재검사', description='관리자 전용: 기존 도도 숙제 완료 메시지를 다시 검사합니다.')
+@app_commands.describe(메시지링크='도도봇의 땅파기 성공 메시지 링크')
+@app_commands.default_permissions(administrator=True)
+async def homework_recheck(interaction: discord.Interaction, 메시지링크: str):
+    if interaction.guild_id != OWNER_GUILD_ID or not interaction.guild:
+        await interaction.response.send_message('운영 서버에서만 사용할 수 있습니다.', ephemeral=True)
+        return
+    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message('서버 관리자만 사용할 수 있습니다.', ephemeral=True)
+        return
+    match = re.fullmatch(r'https?://(?:canary\.|ptb\.)?discord(?:app)?\.com/channels/(\d+)/(\d+)/(\d+)', 메시지링크.strip())
+    if not match or int(match.group(1)) != OWNER_GUILD_ID:
+        await interaction.response.send_message('운영 서버의 도도봇 메시지 링크를 입력해 줘.', ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        channel = interaction.guild.get_channel(int(match.group(2))) or await bot.fetch_channel(int(match.group(2)))
+        source = await channel.fetch_message(int(match.group(3)))
+        result = homework_result(source)
+        if result is None:
+            await interaction.followup.send('인증 조건을 확인하지 못했어. Railway 로그에서 Homework 항목을 확인해 줘.', ephemeral=True)
+            return
+        await announce_homework(source)
+        await interaction.followup.send(f'재검사 완료: <@{result[0]}> · 수고박스 {result[1]}개. 이미 인증한 날짜라면 중복 전송하지 않아.', ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+        log.exception('Homework recheck cannot fetch message')
+        await interaction.followup.send('원본 메시지를 읽을 수 없어. 봇의 채널 보기·메시지 기록 읽기 권한을 확인해 줘.', ephemeral=True)
+    except Exception:
+        log.exception('Homework recheck failed')
+        await interaction.followup.send('재검사 중 오류가 발생했어. Railway 로그를 확인해 줘.', ephemeral=True)
 
 
 async def announce_homework(message: discord.Message):
