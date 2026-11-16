@@ -4,6 +4,7 @@ import asyncio
 import secrets
 import logging
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import asyncpg
 import discord
@@ -17,6 +18,8 @@ DATABASE_URL = os.environ['DATABASE_URL']
 OWNER_GUILD_ID = 1558462262132351096
 OWNER_ID_CHANNEL_IDS = {1566775552076156948, 1566774361736872138}
 TRANSFER_LOG_CHANNEL_ID = 1566774361736872138
+HOMEWORK_CHANNEL_ID = 1566775227885555742
+KST = ZoneInfo("Asia/Seoul")
 # Set to the actual Dodo bot user ID in Railway Variables. 0 disables transfer alerts.
 DODO_BOT_ID = int(os.getenv("DODO_BOT_ID", "0"))
 MENTION_ONLY = re.compile(r'<@!?(\d+)>')
@@ -42,6 +45,11 @@ CREATE TABLE IF NOT EXISTS entries (
 CREATE INDEX IF NOT EXISTS idx_events_open ON events(status,ends_at);
 CREATE TABLE IF NOT EXISTS first_announcements (
  event_id BIGINT PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS homework_announcements (
+ guild_id BIGINT NOT NULL, user_id BIGINT NOT NULL, day DATE NOT NULL,
+ source_message_id BIGINT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+ PRIMARY KEY (guild_id,user_id,day), UNIQUE(source_message_id)
 );
 '''
 
@@ -391,9 +399,112 @@ async def notify_transfer_recipient(message: discord.Message):
                 log.exception("Could not forward transfer or send recipient notification: msg=%s", message.id)
             return
 
+# Homework completion is identified only from Dodo's own interaction response.
+# A successful dig alone is not sufficient: the completion-box award must be present.
+HOMEWORK_BOX = re.compile(r"오늘도\s*수고\s*박스\s*(?:🎁\s*)?(\d[\d,]*)\s*개(?:를|을)?\s*(?:준|지급|획득|받)")
+
+
+def homework_result(message: discord.Message):
+    """Return (actor_id, box_count) only when the Dodo response proves both."""
+    if message.guild is None or message.guild.id != OWNER_GUILD_ID:
+        return None
+    if not DODO_BOT_ID or message.author.id != DODO_BOT_ID:
+        return None
+    texts = [message.content or ""]
+    for embed in message.embeds:
+        texts.extend([embed.title or "", embed.description or ""])
+        for field in embed.fields:
+            texts.extend([field.name or "", field.value or ""])
+    body = "\n".join(texts)
+    if "땅파기 성공" not in body:
+        return None
+    match = HOMEWORK_BOX.search(body)
+    if not match:
+        return None
+    # Interaction metadata belongs to the actual Discord application command.
+    # Do not infer the actor from embed mentions, names, or nearby messages.
+    meta = getattr(message, "interaction_metadata", None) or getattr(message, "interaction", None)
+    user = getattr(meta, "user", None) if meta is not None else None
+    command_name = getattr(meta, "name", None)
+    if not user:
+        log.warning("Homework award found but interaction user unavailable: message=%s", message.id)
+        return None
+    if command_name and "땅파기" not in command_name:
+        log.warning("Homework award with unexpected interaction command: %s", command_name)
+        return None
+    return user.id, int(match.group(1).replace(",", ""))
+
+
+async def announce_homework(message: discord.Message):
+    result = homework_result(message)
+    if result is None:
+        return
+    user_id, box_count = result
+    # The day is the actual Dodo response timestamp in Korean local time.
+    day = message.created_at.astimezone(KST).date()
+    try:
+        async with pool.acquire() as conn:
+            claimed = await conn.fetchval(
+                """INSERT INTO homework_announcements(guild_id,user_id,day,source_message_id)
+                   VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING user_id""",
+                OWNER_GUILD_ID, user_id, day, message.id,
+            )
+        if claimed is None:
+            return
+    except Exception:
+        log.exception("Homework deduplication database error: message=%s", message.id)
+        return
+    try:
+        channel = message.guild.get_channel(HOMEWORK_CHANNEL_ID) or await bot.fetch_channel(HOMEWORK_CHANNEL_ID)
+        member = message.guild.get_member(user_id)
+        if member is None:
+            try:
+                member = await message.guild.fetch_member(user_id)
+            except (discord.NotFound, discord.Forbidden):
+                member = await bot.fetch_user(user_id)
+        embed = discord.Embed(
+            title=f"✅ {day.month}월 {day.day}일 숙제 완료 인증",
+            description=(f"<@{user_id}> 님이 오늘의 숙제를 모두 완료했습니다!\n\n"
+                         f"🎁 오늘도수고박스 **{box_count:,}개 지급**"),
+            color=0x36B37E,
+        )
+        # V18: Send through a channel webhook, using the completing user's
+        # display name and avatar. Do not add a thumbnail to the embed.
+        webhooks = await channel.webhooks()
+        webhook = next(
+            (hook for hook in webhooks
+             if hook.name == "도도 숙제 자동인증"
+             and hook.user is not None and hook.user.id == bot.user.id
+             and hook.token),
+            None,
+        )
+        if webhook is None:
+            webhook = await channel.create_webhook(
+                name="도도 숙제 자동인증",
+                reason="숙제 완료 인증을 유저 이름과 프로필로 게시",
+            )
+        display_name = discord.utils.escape_markdown(member.display_name)[:80] or str(user_id)
+        await webhook.send(
+            username=display_name,
+            avatar_url=member.display_avatar.url,
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        log.info("Homework certified: user=%s date=%s boxes=%s", user_id, day, box_count)
+    except Exception:
+        # A failed send must not permanently consume today's one announcement.
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM homework_announcements WHERE guild_id=$1 AND user_id=$2 AND day=$3 AND source_message_id=$4",
+                OWNER_GUILD_ID, user_id, day, message.id,
+            )
+        log.exception("Homework announcement failed: message=%s", message.id)
+
+
 @bot.event
 async def on_message_edit(before: discord.Message, after: discord.Message):
     await notify_transfer_recipient(after)
+    await announce_homework(after)
 
 @bot.event
 async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
@@ -404,6 +515,7 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
         channel = bot.get_channel(payload.channel_id) or await bot.fetch_channel(payload.channel_id)
         message = await channel.fetch_message(payload.message_id)
         await notify_transfer_recipient(message)
+        await announce_homework(message)
     except (discord.Forbidden, discord.HTTPException, AttributeError):
         log.exception("Could not inspect edited Dodo message")
 
@@ -413,6 +525,7 @@ async def on_message(message:discord.Message):
         return
     if message.author.id == DODO_BOT_ID:
         await notify_transfer_recipient(message)
+        await announce_homework(message)
         return
     if message.author.bot:
         return
