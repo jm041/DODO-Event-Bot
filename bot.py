@@ -435,6 +435,69 @@ def homework_result(message: discord.Message):
     return user.id, int(match.group(1).replace(",", ""))
 
 
+async def send_homework_webhook(channel, member, embed):
+    """Send a homework embed with the member's display identity, no ping."""
+    webhooks = await channel.webhooks()
+    webhook = next(
+        (hook for hook in webhooks
+         if hook.name == "도도 숙제 자동인증"
+         and hook.user is not None and bot.user is not None
+         and hook.user.id == bot.user.id and hook.token),
+        None,
+    )
+    if webhook is None:
+        webhook = await channel.create_webhook(
+            name="도도 숙제 자동인증",
+            reason="숙제 완료 인증을 유저 이름과 프로필로 게시",
+        )
+    display_name = member.display_name[:80] or str(member.id)
+    return await webhook.send(
+        username=display_name,
+        avatar_url=member.display_avatar.url,
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions.none(),
+        wait=True,
+    )
+
+
+@bot.tree.command(name='숙제인증테스트', description='관리자 전용: 숙제 완료 웹후크 인증을 시험합니다.')
+@app_commands.describe(유저='테스트 인증에 표시할 유저', 수고박스='가상 지급 개수 (1~999)')
+@app_commands.default_permissions(administrator=True)
+async def homework_test(
+    interaction: discord.Interaction,
+    유저: discord.Member,
+    수고박스: app_commands.Range[int, 1, 999],
+):
+    if interaction.guild_id != OWNER_GUILD_ID or not interaction.guild:
+        await interaction.response.send_message('운영 서버에서만 사용할 수 있습니다.', ephemeral=True)
+        return
+    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message('서버 관리자만 사용할 수 있습니다.', ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        channel = interaction.guild.get_channel(HOMEWORK_CHANNEL_ID) or await bot.fetch_channel(HOMEWORK_CHANNEL_ID)
+        day = datetime.now(KST).date()
+        embed = discord.Embed(
+            title=f'🧪 테스트 인증 — {day.month}월 {day.day}일 숙제 완료 인증',
+            description=(f'<@{유저.id}> 님이 오늘의 숙제를 모두 완료했습니다!\n\n'
+                         f'🎁 오늘도수고박스 **{수고박스:,}개 지급**\n\n'
+                         '※ 테스트 메시지 · 실제 완료 기록에 반영되지 않음'),
+            color=0x36B37E,
+        )
+        msg = await send_homework_webhook(channel, 유저, embed)
+        await interaction.followup.send(
+            f'테스트 인증을 게시했어. 확인 후 메시지를 삭제하면 돼.\n{msg.jump_url}',
+            ephemeral=True,
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        log.exception('Homework test failed (permissions or Discord API)')
+        await interaction.followup.send('전송 실패: 인증 채널의 웹후크 관리·채널 보기·메시지 보내기 권한을 확인해 줘.', ephemeral=True)
+    except Exception:
+        log.exception('Homework test unexpected error')
+        await interaction.followup.send('테스트 중 오류가 발생했어. Railway 로그를 확인해 줘.', ephemeral=True)
+
+
 async def announce_homework(message: discord.Message):
     result = homework_result(message)
     if result is None:
@@ -468,28 +531,7 @@ async def announce_homework(message: discord.Message):
                          f"🎁 오늘도수고박스 **{box_count:,}개 지급**"),
             color=0x36B37E,
         )
-        # V18: Send through a channel webhook, using the completing user's
-        # display name and avatar. Do not add a thumbnail to the embed.
-        webhooks = await channel.webhooks()
-        webhook = next(
-            (hook for hook in webhooks
-             if hook.name == "도도 숙제 자동인증"
-             and hook.user is not None and hook.user.id == bot.user.id
-             and hook.token),
-            None,
-        )
-        if webhook is None:
-            webhook = await channel.create_webhook(
-                name="도도 숙제 자동인증",
-                reason="숙제 완료 인증을 유저 이름과 프로필로 게시",
-            )
-        display_name = discord.utils.escape_markdown(member.display_name)[:80] or str(user_id)
-        await webhook.send(
-            username=display_name,
-            avatar_url=member.display_avatar.url,
-            embed=embed,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+        await send_homework_webhook(channel, member, embed)
         log.info("Homework certified: user=%s date=%s boxes=%s", user_id, day, box_count)
     except Exception:
         # A failed send must not permanently consume today's one announcement.
