@@ -178,8 +178,13 @@ async def announce_first_closed(event_id):
                 )
             embed.set_footer(text=f'이벤트 #{event_id} · {page_index}/{len(pages)}페이지 · 모집 종료')
             await ch.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except discord.NotFound:
+        # Channel was deleted or is no longer accessible. Keep the claim to avoid
+        # retrying the same impossible delivery every 15 seconds.
+        log.warning('First-come event %s: original channel %s no longer exists; stopping retries',
+                    event_id, e['channel_id'])
     except Exception:
-        # Release claim for retry if posting fails.
+        # Release claim for retry if posting fails transiently.
         async with pool.acquire() as c:
             await c.execute('DELETE FROM first_announcements WHERE event_id=$1', event_id)
         log.exception('Cannot announce first-come event %s', event_id)
@@ -401,8 +406,10 @@ async def notify_transfer_recipient(message: discord.Message):
 
 # Homework completion is identified only from Dodo's own interaction response.
 # A successful dig alone is not sufficient: the completion-box award must be present.
+# Dodo may put Discord markdown (*, _, etc.) between the gift emoji, count and suffix.
+# Match the number near the award phrase without depending on the emoji or markdown.
 HOMEWORK_BOX = re.compile(
-    r"오늘도\s*수고\s*박스[\s\S]{0,80}?(\d[\d,]*)\s*개(?:를|을)?\s*(?:준|지급|획득|받)"
+    r"오늘도\s*수고\s*박스[\s\S]{0,120}?(\d[\d,]*)[\s*_~`]*개(?:를|을)?"
 )
 HOMEWORK_DONE = re.compile(r"오늘의\s*모든\s*할\s*일을\s*다\s*했구나")
 
