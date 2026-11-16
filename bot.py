@@ -451,9 +451,24 @@ async def send_homework_webhook(channel, member, embed):
             reason="숙제 완료 인증을 유저 이름과 프로필로 게시",
         )
     display_name = member.display_name[:80] or str(member.id)
+    # Prefer the member's server avatar, then their global user avatar.
+    # Fetching the user also handles an incomplete member object in cache.
+    avatar_asset = member.guild_avatar or member.avatar
+    if avatar_asset is None:
+        try:
+            fetched_user = await bot.fetch_user(member.id)
+            avatar_asset = fetched_user.avatar
+        except discord.HTTPException:
+            log.warning('Could not fetch global avatar for user=%s', member.id)
+    if avatar_asset is None:
+        log.warning('No custom avatar found for user=%s; using default avatar', member.id)
+        avatar_asset = member.default_avatar
+    avatar_url = avatar_asset.replace(format='png', size=256).url if not avatar_asset.is_animated() else avatar_asset.replace(format='gif', size=256).url
+    log.info('Homework webhook avatar: user=%s custom=%s url=%s',
+             member.id, bool(member.guild_avatar or member.avatar), avatar_url)
     return await webhook.send(
         username=display_name,
-        avatar_url=member.display_avatar.url,
+        avatar_url=avatar_url,
         embed=embed,
         allowed_mentions=discord.AllowedMentions.none(),
         wait=True,
